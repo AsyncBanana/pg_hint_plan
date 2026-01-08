@@ -2952,8 +2952,7 @@ pop_hint(void)
  * Retrieve and store hint string from given query or from the hint table.
  */
 static void
-get_current_hint_string(Query *query, const char *query_str,
-						JumbleState *jstate)
+get_current_hint_string(Query *query, const char *query_str)
 {
 	MemoryContext oldcontext;
 
@@ -3104,12 +3103,13 @@ pg_hint_plan_post_parse_analyze(ParseState *pstate, Query *query,
 		return;
 
 	/*
-	 * Jumble state is required when hint table is used.  This is the only
-	 * chance to have one already generated in-core.  If it's not the case, no
-	 * use to do the work now and pg_hint_plan_planner() will do the all work.
+	 * A query ID (and per-se a JumbleState) is required when the hint table
+	 * is used.  This is the only chance to have one already generated in
+	 * core.  If no query ID is assigned, there is no need to do the work;
+	 * let's pg_hint_plan_planner() do the all work.
 	 */
-	if (jstate)
-		get_current_hint_string(query, pstate->p_sourcetext, jstate);
+	if (query->queryId != INT64CONST(0))
+		get_current_hint_string(query, pstate->p_sourcetext);
 }
 
 /*
@@ -3158,7 +3158,7 @@ pg_hint_plan_planner(Query *parse, const char *query_string, int cursorOptions,
 
 		current_hint_retrieved = false;
 
-		get_current_hint_string(parse, query_string, NULL);
+		get_current_hint_string(parse, query_string);
 
 		if (current_hint_str == NULL)
 			current_hint_str = tmp_hint_str;
@@ -3166,7 +3166,7 @@ pg_hint_plan_planner(Query *parse, const char *query_string, int cursorOptions,
 			pfree((void *) tmp_hint_str);
 	}
 	else
-		get_current_hint_string(parse, query_string, NULL);
+		get_current_hint_string(parse, query_string);
 
 	/* No hints, go the normal way */
 	if (!current_hint_str)
