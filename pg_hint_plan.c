@@ -38,8 +38,10 @@
 #include "parser/analyze.h"
 #include "parser/parsetree.h"
 #include "parser/scansup.h"
+#include "parser/parse_expr.h"
 #include "partitioning/partbounds.h"
 #include "tcop/utility.h"
+#include "utils/acl.h"
 #include "utils/builtins.h"
 #include "utils/float.h"
 #include "utils/lsyscache.h"
@@ -504,7 +506,7 @@ static Hint *MemoizeHintCreate(const char *hint_str, const char *keyword,
 static void quote_value(StringInfo buf, const char *value);
 
 static const char *parse_quoted_value(const char *str, char **word,
-									  bool truncate);
+									  bool truncate, int *nesting_depth);
 
 RelOptInfo *pg_hint_plan_standard_join_search(PlannerInfo *root,
 											  int levels_needed,
@@ -557,6 +559,7 @@ static bool pg_hint_plan_enable_hint_table = false;
 static int	plpgsql_recurse_level = 0;	/* PLpgSQL recursion level            */
 static int	recurse_level = 0;	/* recursion level incl. direct SPI calls */
 static int	hint_inhibit_level = 0; /* Inhibit hinting if this is above 0 */
+static bool is_rows_function = false; /* If a function is called by a row hint, prevent that hint from recursing */
 
  /* (This could not be above 1)        */
 static int	max_hint_nworkers = -1; /* Maximum nworkers of Workers hints */
@@ -1652,7 +1655,7 @@ skip_parenthesis(const char *str, char parenthesis)
  * Parsed token is truncated within NAMEDATALEN-1 bytes, when truncate is true.
  */
 static const char *
-parse_quoted_value(const char *str, char **word, bool truncate)
+parse_quoted_value(const char *str, char **word, bool truncate, int *nesting_depth)
 {
 	StringInfoData buf;
 	bool		in_quote;
@@ -1698,9 +1701,17 @@ parse_quoted_value(const char *str, char **word, bool truncate)
 					break;
 			}
 		}
-		else if (isspace(*str) || *str == '(' || *str == ')' || *str == '"' ||
+		else if (*str == '(' || *str==')')
+		{
+			if (nesting_depth==NULL) break;
+			/* we want the parenthesis to be in its own token, so we only append it if the token is otherwise empty */
+			*nesting_depth+=*str=='('?1:-1;
+			if (*nesting_depth<0) break;
+		}
+		else if (isspace(*str) || *str == '"' ||
 				 *str == '\0')
-			break;
+			if (nesting_depth==NULL || *nesting_depth<=0)
+				break;
 
 		appendStringInfoCharMacro(&buf, *str++);
 	}
@@ -1760,7 +1771,7 @@ parse_parentheses_Leading_in(const char *str, OuterInnerRels **outer_inner)
 		{
 			char	   *name;
 
-			if ((str = parse_quoted_value(str, &name, true)) == NULL)
+			if ((str = parse_quoted_value(str, &name, true, NULL)) == NULL)
 				break;
 			else
 				outer_inner_rels = OuterInnerRelsCreate(name, NIL);
@@ -1803,7 +1814,7 @@ parse_parentheses_Leading(const char *str, List **name_list,
 		/* Store words in parentheses into name_list. */
 		while (*str != ')' && *str != '\0')
 		{
-			if ((str = parse_quoted_value(str, &name, truncate)) == NULL)
+			if ((str = parse_quoted_value(str, &name, truncate, NULL)) == NULL)
 			{
 				list_free(*name_list);
 				return NULL;
@@ -1823,6 +1834,7 @@ static const char *
 parse_parentheses(const char *str, List **name_list, HintKeyword keyword)
 {
 	char	   *name;
+	int nesting_depth = 0;
 	bool		truncate = true;
 
 	if ((str = skip_parenthesis(str, '(')) == NULL)
@@ -1831,9 +1843,9 @@ parse_parentheses(const char *str, List **name_list, HintKeyword keyword)
 	skip_space(str);
 
 	/* Store words in parentheses into name_list. */
-	while (*str != ')' && *str != '\0')
+	while ((nesting_depth>0 || *str!=')' /* Stop only if encounters outer parenthesis closing hint */) && *str != '\0')
 	{
-		if ((str = parse_quoted_value(str, &name, truncate)) == NULL)
+		if ((str = parse_quoted_value(str, &name, truncate, &nesting_depth)) == NULL)
 		{
 			list_free(*name_list);
 			return NULL;
@@ -1849,6 +1861,7 @@ parse_parentheses(const char *str, List **name_list, HintKeyword keyword)
 		{
 			truncate = false;
 		}
+		elog(WARNING,"nesting depth %d",nesting_depth);
 	}
 
 	if ((str = skip_parenthesis(str, ')')) == NULL)
@@ -2472,6 +2485,141 @@ SetHintParse(SetHint *hint, const char *str)
 	return str;
 }
 
+/*
+ * Context for checking expression safety in Rows hints.
+ */
+typedef struct RowsExprCheckContext
+{
+	Hint	   *hint;
+	const char *expr_str;
+} RowsExprCheckContext;
+
+static bool
+check_rows_expr_safety_walker(Node *node, RowsExprCheckContext *context)
+{
+	if (node == NULL)
+		return false;
+
+	switch (nodeTag(node))
+	{
+		case T_Const:
+			return false;
+
+		case T_FuncExpr:
+			{
+				FuncExpr   *func = (FuncExpr *) node;
+				AclResult	aclresult;
+
+				/* Check EXECUTE permission on the function */
+				aclresult = object_aclcheck(ProcedureRelationId, func->funcid,
+											GetUserId(), ACL_EXECUTE);
+				if (aclresult != ACLCHECK_OK)
+				{
+					hint_ereport(context->expr_str,
+								 ("%s hint: permission denied for function",
+								  context->hint->keyword));
+					return true;	/* abort walk */
+				}
+				/* Recurse into arguments */
+				return expression_tree_walker(node,
+											  check_rows_expr_safety_walker,
+											  context);
+			}
+
+		case T_OpExpr:
+		case T_ScalarArrayOpExpr:
+			{
+				Oid			funcid = InvalidOid;
+				AclResult	aclresult;
+
+				if (IsA(node, OpExpr))
+					funcid = ((OpExpr *) node)->opfuncid;
+				else if (IsA(node, ScalarArrayOpExpr))
+					funcid = ((ScalarArrayOpExpr *) node)->opfuncid;
+
+				if (OidIsValid(funcid))
+				{
+					aclresult = object_aclcheck(ProcedureRelationId, funcid,
+												GetUserId(), ACL_EXECUTE);
+					if (aclresult != ACLCHECK_OK)
+					{
+						hint_ereport(context->expr_str,
+									 ("%s hint: permission denied for operator",
+									  context->hint->keyword));
+						return true;
+					}
+				}
+				return expression_tree_walker(node,
+											  check_rows_expr_safety_walker,
+											  context);
+			}
+
+		case T_BoolExpr:
+		case T_NullTest:
+		case T_BooleanTest:
+		case T_CoerceViaIO:
+		case T_RelabelType:
+		case T_CoerceToDomain:
+		case T_CaseExpr:
+		case T_CaseWhen:
+		case T_CaseTestExpr:
+		case T_ArrayExpr:
+		case T_RowExpr:
+		case T_CoalesceExpr:
+		case T_MinMaxExpr:
+		case T_NullIfExpr:
+			return expression_tree_walker(node,
+										  check_rows_expr_safety_walker,
+										  context);
+
+		case T_Var:
+			hint_ereport(context->expr_str,
+						 ("%s hint: column references not allowed",
+						  context->hint->keyword));
+			return true;
+
+		case T_SubLink:
+		case T_SubPlan:
+			hint_ereport(context->expr_str,
+						 ("%s hint: subqueries not allowed",
+						  context->hint->keyword));
+			return true;
+
+		case T_Aggref:
+			hint_ereport(context->expr_str,
+						 ("%s hint: aggregate functions not allowed",
+						  context->hint->keyword));
+			return true;
+
+		case T_WindowFunc:
+			hint_ereport(context->expr_str,
+						 ("%s hint: window functions not allowed",
+						  context->hint->keyword));
+			return true;
+
+		default:
+			hint_ereport(context->expr_str,
+						 ("%s hint: unsupported expression type",
+						  context->hint->keyword));
+			return true;
+	}
+}
+
+/*
+ * Check if an expression is safe to evaluate in a Rows hint.
+ * Returns true if safe, false if an error was reported.
+ */
+static bool
+check_rows_expr_safety(Node *expr, Hint *hint, const char *expr_str)
+{
+	RowsExprCheckContext context;
+
+	context.hint = hint;
+	context.expr_str = expr_str;
+
+	return !check_rows_expr_safety_walker(expr, &context);
+}
+
 static const char *
 RowsHintParse(RowsHint *hint, const char *str)
 {
@@ -2544,11 +2692,129 @@ RowsHintParse(RowsHint *hint, const char *str)
 	hint->rows = strtod(rows_str, &end_ptr);
 	if (*end_ptr)
 	{
-		hint_ereport(rows_str,
-					 ("%s hint requires valid number as rows estimation.",
-					  hint->base.keyword));
-		hint->base.state = HINT_STATE_ERROR;
-		return str;
+		List	   *raw_parsetree;
+		RawStmt	   *raw_stmt;
+		Node	   *raw_expr;
+		ParseState *pstate;
+		Node	   *cooked_expr;
+		Expr	   *planned_expr;
+		Datum		result;
+		Oid			result_type;
+		bool		isnull;
+
+		/* Parse expression using PL/pgSQL expression mode */
+		PG_TRY();
+		{
+			raw_parsetree = raw_parser(rows_str, RAW_PARSE_PLPGSQL_EXPR);
+		}
+		PG_CATCH();
+		{
+			FlushErrorState();
+			hint_ereport(rows_str, ("%s hint: invalid expression syntax", hint->base.keyword));
+			hint->base.state = HINT_STATE_ERROR;
+			return str;
+		}
+		PG_END_TRY();
+
+		if (list_length(raw_parsetree) != 1)
+		{
+			hint_ereport(rows_str, ("%s hint: expression parse error", hint->base.keyword));
+			hint->base.state = HINT_STATE_ERROR;
+			return str;
+		}
+
+		raw_stmt = linitial_node(RawStmt, raw_parsetree);
+		raw_expr = raw_stmt->stmt;
+
+		/*
+		 * RAW_PARSE_PLPGSQL_EXPR wraps the expression in a SelectStmt.
+		 * Extract the actual expression from the target list.
+		 */
+		if (IsA(raw_expr, SelectStmt))
+		{
+			SelectStmt *select = (SelectStmt *) raw_expr;
+			if (select->targetList != NIL)
+			{
+				ResTarget *rt = linitial_node(ResTarget, select->targetList);
+				raw_expr = rt->val;
+			}
+		}
+
+		/* Transform expression - this handles function resolution and type coercion */
+		pstate = make_parsestate(NULL);
+		pstate->p_sourcetext = rows_str;
+
+		PG_TRY();
+		{
+			cooked_expr = transformExpr(pstate, raw_expr, EXPR_KIND_OTHER);
+		}
+		PG_CATCH();
+		{
+			FlushErrorState();
+			hint_ereport(rows_str, ("%s hint: cannot resolve function", hint->base.keyword));
+			hint->base.state = HINT_STATE_ERROR;
+			free_parsestate(pstate);
+			return str;
+		}
+		PG_END_TRY();
+
+		/* Check for volatile functions */
+		if (contain_volatile_functions(cooked_expr))
+		{
+			hint_ereport(rows_str, ("%s hint: volatile functions not allowed", hint->base.keyword));
+			hint->base.state = HINT_STATE_ERROR;
+			free_parsestate(pstate);
+			return str;
+		}
+
+		/* Check expression safety: only constants, operators, and permitted functions */
+		if (!check_rows_expr_safety(cooked_expr, &hint->base, rows_str))
+		{
+			hint->base.state = HINT_STATE_ERROR;
+			free_parsestate(pstate);
+			return str;
+		}
+
+		result_type = exprType(cooked_expr);
+		free_parsestate(pstate);
+
+		/* Set flag BEFORE planning to prevent recursion in hint parsing */
+		is_rows_function = true;
+
+		/* Plan and evaluate the expression */
+		planned_expr = expression_planner((Expr *) cooked_expr);
+		{
+			Const *eval_result = (Const *) evaluate_expr(planned_expr, result_type, -1, InvalidOid);
+			result = eval_result->constvalue;
+			isnull = eval_result->constisnull;
+		}
+
+		/* Reset recursion guard */
+		is_rows_function = false;
+
+		if (isnull)
+		{
+			hint_ereport(rows_str, ("%s hint: expression returned NULL", hint->base.keyword));
+			hint->base.state = HINT_STATE_ERROR;
+			return str;
+		}
+		/* Convert result to double */
+		if (result_type == FLOAT8OID)
+			hint->rows = DatumGetFloat8(result);
+		else if (result_type == FLOAT4OID)
+			hint->rows = (double) DatumGetFloat4(result);
+		else if (result_type == INT4OID || result_type == INT2OID)
+			hint->rows = (double) DatumGetInt32(result);
+		else if (result_type == INT8OID)
+			hint->rows = (double) DatumGetInt64(result);
+		else if (result_type == NUMERICOID)
+			hint->rows = DatumGetFloat8(DirectFunctionCall1(numeric_float8, result));
+		else
+		{
+			hint_ereport(rows_str, ("%s hint: expression did not return numeric", hint->base.keyword));
+			hint->base.state = HINT_STATE_ERROR;
+			return str;
+		}
 	}
 
 	/* A join hint requires at least two relations */
@@ -3146,10 +3412,10 @@ pg_hint_plan_planner(Query *parse, const char *query_string, int cursorOptions,
 	}
 
 	/*
-	 * SQL commands invoked in plpgsql functions may also have hints. In that
+	 * SQL commands invoked in plpgsql functions or Rows() hints may also have hints. In that
 	 * case override the upper level hint by the new hint.
 	 */
-	if (plpgsql_recurse_level > 0)
+	if (plpgsql_recurse_level > 0 || is_rows_function)
 	{
 		const char *tmp_hint_str = current_hint_str;
 
@@ -3160,10 +3426,12 @@ pg_hint_plan_planner(Query *parse, const char *query_string, int cursorOptions,
 
 		get_current_hint_string(parse, query_string);
 
-		if (current_hint_str == NULL)
+		if (current_hint_str == NULL && !is_rows_function /* to prevent loops, row hint functions should never inherit hints */)
 			current_hint_str = tmp_hint_str;
 		else if (tmp_hint_str != NULL)
 			pfree((void *) tmp_hint_str);
+		/* allow any nested/subsequent planner calls to function normally */
+		is_rows_function = false;
 	}
 	else
 		get_current_hint_string(parse, query_string);
